@@ -93,7 +93,7 @@ async function vercel(
 /** Vercel account/team DNS model. */
 export const model = {
   type: "@goodcraft/vercel",
-  version: "2026.06.14.1",
+  version: "2026.06.14.2",
   globalArguments: GlobalArgsSchema,
   resources: {
     "domains": {

@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@goodcraft/vercel"
-version: "2026.06.14.1"
+version: "2026.06.14.2"
 description: "Vercel DNS — list the account's domains and idempotently upsert DNS records (skip when an identical type+name+value already exists)."
 repository: "https://github.com/nathanworking/swamp-vercel-dns"
 paths:
