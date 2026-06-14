@@ -1,7 +1,7 @@
 manifestVersion: 1
 name: "@goodcraft/vercel"
-version: "2026.06.14.2"
-description: "Vercel DNS — list the account's domains and idempotently upsert DNS records (skip when an identical type+name+value already exists)."
+version: "2026.06.14.3"
+description: "Vercel DNS — list the account's domains, list a domain's records, idempotently upsert records (skip when an identical type+name+value exists), and delete records by id; enough to cleanly re-point an apex from Vercel to an external server."
 repository: "https://github.com/nathanworking/swamp-vercel-dns"
 paths:
   base: manifest

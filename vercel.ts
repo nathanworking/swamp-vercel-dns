@@ -2,11 +2,12 @@
  * Vercel DNS integration for swamp.
  *
  * Models a Vercel account/team and manages DNS records via the Vercel REST API
- * (https://api.vercel.com). v1 ships:
- * - `sync` — list the account's domains (read-only; confirms the token + shows
- *   which domains Vercel manages).
+ * (https://api.vercel.com):
+ * - `sync` — list the account's domains (read-only; confirms the token).
+ * - `listRecords` — list a domain's DNS records (read-only).
  * - `upsertRecord` — idempotently ensure a single DNS record exists (skip if an
  *   identical type+name+value already exists; create otherwise).
+ * - `deleteRecord` — delete a record by id (dryRun default; missing → absent).
  *
  * The API token is supplied through `globalArguments.apiToken`, wired to a vault
  * expression at model-creation time — never a literal token. Team-scoped tokens
@@ -56,6 +57,22 @@ const UpsertResultSchema = z.object({
   recordId: z.string().optional(),
 });
 
+/** Snapshot of a domain's DNS records. */
+const RecordsResourceSchema = z.object({
+  fetchedAt: z.iso.datetime(),
+  domain: z.string(),
+  count: z.number(),
+  records: z.array(RecordSchema),
+});
+
+/** Result of a deleteRecord call. */
+const DeleteResultSchema = z.object({
+  fetchedAt: z.iso.datetime(),
+  domain: z.string(),
+  recordId: z.string(),
+  status: z.enum(["deleted", "would-delete", "absent"]),
+});
+
 /** Append the team query param when a team-scoped token is configured. */
 function teamSuffix(teamId: string | undefined, joiner = "?"): string {
   return teamId ? `${joiner}teamId=${encodeURIComponent(teamId)}` : "";
@@ -93,7 +110,7 @@ async function vercel(
 /** Vercel account/team DNS model. */
 export const model = {
   type: "@goodcraft/vercel",
-  version: "2026.06.14.2",
+  version: "2026.06.14.3",
   globalArguments: GlobalArgsSchema,
   resources: {
     "domains": {
@@ -105,6 +122,18 @@ export const model = {
     "recordUpsert": {
       description: "Result of the last upsertRecord call",
       schema: UpsertResultSchema,
+      lifetime: "infinite",
+      garbageCollection: 10,
+    },
+    "records": {
+      description: "Snapshot of a domain's DNS records",
+      schema: RecordsResourceSchema,
+      lifetime: "infinite",
+      garbageCollection: 10,
+    },
+    "recordDelete": {
+      description: "Result of the last deleteRecord call",
+      schema: DeleteResultSchema,
       lifetime: "infinite",
       garbageCollection: 10,
     },
@@ -148,9 +177,122 @@ export const model = {
         return { dataHandles: [handle] };
       },
     },
+    listRecords: {
+      description: "List a domain's DNS records (read-only)",
+      arguments: z.object({
+        domain: z.string().min(1),
+      }),
+      execute: async (
+        args: { domain: string },
+        context: {
+          globalArgs: GlobalArgs;
+          signal: AbortSignal;
+          logger: {
+            info: (msg: string, props?: Record<string, unknown>) => void;
+          };
+          writeResource: (
+            specName: string,
+            name: string,
+            data: Record<string, unknown>,
+          ) => Promise<{ name: string }>;
+        },
+      ): Promise<{ dataHandles: Array<{ name: string }> }> => {
+        const payload = await vercel(
+          context.globalArgs,
+          "GET",
+          `/v4/domains/${encodeURIComponent(args.domain)}/records${
+            teamSuffix(context.globalArgs.teamId)
+          }`,
+          context.signal,
+        );
+        const records = z.array(RecordSchema).parse(payload.records ?? []);
+
+        context.logger.info("Listed {count} records for {domain}", {
+          count: records.length,
+          domain: args.domain,
+        });
+
+        const handle = await context.writeResource(
+          "records",
+          `records-${args.domain}`,
+          {
+            fetchedAt: new Date().toISOString(),
+            domain: args.domain,
+            count: records.length,
+            records,
+          },
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+    deleteRecord: {
+      description:
+        "Delete a DNS record by its id (find ids via listRecords). dryRun=true (default) plans without deleting; a missing record is reported as absent.",
+      arguments: z.object({
+        domain: z.string().min(1),
+        recordId: z.string().min(1),
+        dryRun: z.boolean().default(true),
+      }),
+      execute: async (
+        args: { domain: string; recordId: string; dryRun: boolean },
+        context: {
+          globalArgs: GlobalArgs;
+          signal: AbortSignal;
+          logger: {
+            info: (msg: string, props?: Record<string, unknown>) => void;
+          };
+          writeResource: (
+            specName: string,
+            name: string,
+            data: Record<string, unknown>,
+          ) => Promise<{ name: string }>;
+        },
+      ): Promise<{ dataHandles: Array<{ name: string }> }> => {
+        let status: "deleted" | "would-delete" | "absent";
+        if (args.dryRun) {
+          status = "would-delete";
+        } else {
+          try {
+            await vercel(
+              context.globalArgs,
+              "DELETE",
+              `/v2/domains/${encodeURIComponent(args.domain)}/records/${
+                encodeURIComponent(args.recordId)
+              }${teamSuffix(context.globalArgs.teamId)}`,
+              context.signal,
+            );
+            status = "deleted";
+          } catch (e) {
+            if (e instanceof Error && e.message.includes(" 404 ")) {
+              status = "absent";
+            } else {
+              throw e;
+            }
+          }
+        }
+
+        context.logger.info("deleteRecord {domain} {recordId}: {status}", {
+          domain: args.domain,
+          recordId: args.recordId,
+          status,
+        });
+
+        const handle = await context.writeResource(
+          "recordDelete",
+          `delete-${args.recordId}`,
+          {
+            fetchedAt: new Date().toISOString(),
+            domain: args.domain,
+            recordId: args.recordId,
+            status,
+          },
+        );
+        return { dataHandles: [handle] };
+      },
+    },
     upsertRecord: {
       description:
-        "Idempotently ensure a DNS record exists (skip if an identical type+name+value record is already present)",
+        "Idempotently ensure a DNS record exists (skip if an identical type+name+value record is already present). Adds alongside Vercel's default records (which the API cannot delete) — never removes them; for an apex pointing off-Vercel, prefer a subdomain since your record coexists with Vercel's default A.",
       arguments: z.object({
         domain: z.string().min(1),
         type: z.string().default("A"),
